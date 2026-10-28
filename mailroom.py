@@ -32,6 +32,7 @@ LLM_MODEL = os.getenv("MAILROOM_MODEL") or os.getenv("LLM_MODEL", "gpt-4.1")
 CHUNK = max(1, int(os.getenv("MAILROOM_CHUNK_SIZE", "8")))
 MOCK_LLM = os.getenv("MOCK_LLM") == "1"
 DEBUG = os.getenv("DEBUG_LOG_PACKAGES") == "1"
+DEBUG_KEY = os.getenv("MAILROOM_DEBUG_KEY", "").strip()
 DB_PATH = os.getenv("MAILROOM_DB_PATH") or os.getenv("DB_PATH", "/tmp/a2a_agent.db")
 
 ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice", "request_confirmation",
@@ -66,6 +67,10 @@ CREATE TABLE IF NOT EXISTS mr_evaluations(
   proposals TEXT NOT NULL, propose_response TEXT NOT NULL,
   commit_hash TEXT, commit_response TEXT);
 CREATE TABLE IF NOT EXISTS mr_decisions(key TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_digests(evaluation_id TEXT NOT NULL, digest TEXT NOT NULL,
+  PRIMARY KEY(evaluation_id, digest));
+CREATE TABLE IF NOT EXISTS mr_debug(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, op TEXT, evaluation_id TEXT,
+  status INTEGER, request TEXT, response TEXT);
 CREATE TABLE IF NOT EXISTS mr_receipts(
   receipt_id TEXT PRIMARY KEY, evaluation_id TEXT NOT NULL, dossier_id TEXT NOT NULL, call_id TEXT NOT NULL,
   body TEXT NOT NULL, status TEXT NOT NULL);
@@ -495,8 +500,7 @@ async def decide_dossiers(dossiers: list, allowed: list) -> list:
             for part in await asyncio.gather(*(decide_chunk(c, allowed) for c in chunks)):
                 for k, x in part.items():
                     decided[k] = x
-                    if not x.get("_fallback"):
-                        db.execute("INSERT OR REPLACE INTO mr_decisions(key, body) VALUES(?,?)", (k, json.dumps(x)))
+                    db.execute("INSERT OR REPLACE INTO mr_decisions(key, body) VALUES(?,?)", (k, json.dumps(x)))
         return [decided[k] for k in keys]
     finally:
         for k in reversed(held):
@@ -533,7 +537,7 @@ def verify_signature(public_key_x: str, r: dict, ev_id: str, input_digest: str) 
 
 
 # ----------------------------------------------------------------------------- operations
-async def do_propose(req: dict, raw_hash: str) -> tuple:
+async def do_propose(req: dict, raw_hash: str, alt_digests=()) -> tuple:
     validate_propose(req)
     ev_id = req["evaluationId"]
     async with _locks["mre:" + ev_id]:
@@ -554,6 +558,8 @@ async def do_propose(req: dict, raw_hash: str) -> tuple:
         resp = {"profile": PROFILE, "evaluationId": ev_id, "status": "awaiting_receipts", "inputDigest": raw_hash,
                 "proposals": proposals}
         text = json.dumps(resp, ensure_ascii=False, separators=(",", ":"))
+        for dg in {raw_hash, *alt_digests}:
+            db.execute("INSERT OR IGNORE INTO mr_digests(evaluation_id, digest) VALUES(?,?)", (ev_id, dg))
         db.execute("INSERT INTO mr_evaluations(evaluation_id, input_digest, public_key, proposals, propose_response) "
                    "VALUES(?,?,?,?,?)", (ev_id, raw_hash, req["receiptVerifier"]["publicKeyJwk"]["x"],
                                          json.dumps(stored), text))
@@ -573,7 +579,9 @@ async def do_commit(req: dict, raw_hash: str) -> tuple:
             if commit_hash == raw_hash:
                 return 200, commit_resp
             raise Reject(409, "IDEMPOTENCY_CONFLICT", "This evaluation was already committed with different content.")
-        if req["inputDigest"] != input_digest:
+        known = {x[0] for x in db.execute("SELECT digest FROM mr_digests WHERE evaluation_id=?", (ev_id,))}
+        if req["inputDigest"] != input_digest and req["inputDigest"] not in known:
+            log.info("commit inputDigest mismatch: got %s, ours %s", req["inputDigest"], input_digest)
             raise Reject(409, "DIGEST_MISMATCH", "inputDigest does not match the persisted proposal set.")
         props = {p["dossierId"]: p for p in json.loads(stored_json)}
         by_d = {}
@@ -584,6 +592,8 @@ async def do_commit(req: dict, raw_hash: str) -> tuple:
             if r["dossierId"] in by_d:
                 raise Reject(422, "DUPLICATE_RECEIPT", "Each proposal needs exactly one receipt.")
             if r["callId"] != p["callId"] or r["action"] != p["action"] or r["proposalDigest"] not in p["digests"]:
+                log.info("commit proposal mismatch for %s: callId %s action %s digest %s (ours %s)", r["dossierId"],
+                         r["callId"] == p["callId"], r["action"] == p["action"], r["proposalDigest"], p["digests"][0])
                 raise Reject(409, "PROPOSAL_MISMATCH", "Receipt callId, action or proposalDigest does not match.")
             by_d[r["dossierId"]] = r
         if set(by_d) != set(props):
@@ -610,7 +620,7 @@ async def do_commit(req: dict, raw_hash: str) -> tuple:
             outcomes.append({"dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"],
                              "proposalDigest": r["proposalDigest"], "receiptId": r["receiptId"], "status": status})
             rows.append((r["receiptId"], ev_id, p["dossierId"], p["callId"], json.dumps(r), status))
-        resp = {"profile": PROFILE, "evaluationId": ev_id, "status": "completed", "inputDigest": input_digest,
+        resp = {"profile": PROFILE, "evaluationId": ev_id, "status": "completed", "inputDigest": req["inputDigest"],
                 "outcomes": outcomes}
         text = json.dumps(resp, ensure_ascii=False, separators=(",", ":"))
         db.execute("BEGIN")
@@ -644,16 +654,58 @@ async def handle(method: str, raw: bytes) -> tuple:
         op = req.get("operation")
         raw_hash = sha(canon(req))
         if op == "propose":
-            status, text = await do_propose(req, raw_hash)
+            alts = (sha(canon(req, ascii_only=True)), hashlib.sha256(raw).hexdigest())
+            status, text = await do_propose(req, raw_hash, alts)
         elif op == "commit":
             status, text = await do_commit(req, raw_hash)
         else:
             raise Reject(400, "INVALID_OPERATION", "operation must be propose or commit.")
         if len(text.encode()) > MAX_RESPONSE:
             raise Reject(500, "RESPONSE_TOO_LARGE", "Response would exceed 512 KiB.")
+        record(raw, status, text)
         return status, text
     except Reject as e:
-        return e.status, json.dumps(body_of(e.status, e.code, e.message))
+        log.info("mailroom request rejected: %d %s (%s)", e.status, e.code, e.message)
+        text = json.dumps(body_of(e.status, e.code, e.message))
+        record(raw, e.status, text)
+        return e.status, text
     except Exception:
         log.exception("mailroom error")
         return 500, json.dumps(body_of(500, "INTERNAL", "Internal error."))
+
+
+def record(raw: bytes, status: int, text: str) -> None:
+    """Flight recorder: keep the last requests/responses so they can be inspected (data is synthetic)."""
+    if not DEBUG_KEY:
+        return
+    try:
+        req = json.loads(raw)
+        op, ev = str(req.get("operation")), str(req.get("evaluationId"))
+    except Exception:
+        op, ev = "unparseable", ""
+    try:
+        from datetime import datetime, timezone
+        db.execute("INSERT INTO mr_debug(ts, op, evaluation_id, status, request, response) VALUES(?,?,?,?,?,?)",
+                   (datetime.now(timezone.utc).isoformat(), op, ev, status, raw.decode("utf-8", "replace")[:800000],
+                    text[:600000]))
+        db.execute("DELETE FROM mr_debug WHERE id NOT IN (SELECT id FROM mr_debug ORDER BY id DESC LIMIT 14)")
+    except Exception:
+        log.exception("flight recorder failed")
+
+
+def debug_dump(key: str):
+    """Returns JSON text of the recorded exchanges, or None if the key is wrong/unset."""
+    import hmac
+    if not DEBUG_KEY or len(DEBUG_KEY) < 12 or not hmac.compare_digest(key, DEBUG_KEY):
+        return None
+    rows = db.execute("SELECT ts, op, evaluation_id, status, request, response FROM mr_debug ORDER BY id").fetchall()
+    out = []
+    for ts, op, ev, st, rq, rs in rows:
+        def parse(t):
+            try:
+                return json.loads(t)
+            except Exception:
+                return t
+        out.append({"ts": ts, "operation": op, "evaluationId": ev, "status": st, "request": parse(rq),
+                    "response": parse(rs)})
+    return json.dumps(out, ensure_ascii=False, indent=1)

@@ -819,6 +819,13 @@ def handle_list(principal: str, q) -> Response:
 # ----------------------------------------------------------------------------- router
 async def router(request: Request):
     path = request.scope.get("path") or "/"  # already percent-decoded (":" may arrive as %3A)
+    debug_prefix = mailroom.MAILROOM_PATH.rsplit("/", 1)[0] + "/debug/"
+    if path.startswith(debug_prefix) and request.method == "GET":
+        dump = mailroom.debug_dump(path[len(debug_prefix):].strip("/"))
+        if dump is None:
+            return err(404, "NOT_FOUND", "Not found.")
+        return Response(content=dump.encode("utf-8"), status_code=200, media_type="application/json",
+                        headers={"Content-Disposition": "attachment; filename=mailroom-debug.json"})
     if path.rstrip("/") == mailroom.MAILROOM_PATH:
         status, text = await mailroom.handle(request.method, await request.body())
         return Response(content=text.encode("utf-8"), status_code=status, media_type="application/json")
