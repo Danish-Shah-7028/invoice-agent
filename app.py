@@ -202,7 +202,7 @@ def agent_card(request: Request) -> dict:
 # decoys are labelled, and the model picks the action plus the ONE paragraph that decides it. Evidence refs
 # are then copied from that paragraph (so they are always the exact three refs from the decisive paragraph),
 # and the invoice facts are parsed from the cover sheet with a regex instead of being guessed.
-PROMPT_VERSION = "v2-paragraphs"
+PROMPT_VERSION = "v3-paragraphs-raw"
 VERIFY_SETTLE = os.getenv("VERIFY_SETTLE", "1") == "1"
 
 BRACKET_RE = re.compile(r"\[([^\[\]\n]{1,120})\]")
@@ -243,9 +243,15 @@ Method for each package:
    revision; superseded revisions and drafts do not apply).
 4. Choose the action.
 
+Some packages have "layout":"raw" and a "rawPackage" instead of paragraphs. For those, read the whole package with
+the same rules, ignore boilerplate, the cover-sheet ref and archive/training refs, and return "evidenceRefs": the
+exact three refs (without brackets) from the passage that determines the action, plus vendorName, invoiceNumber,
+amountMinor and currency.
+
 Return JSON only:
 {"decisions":[{"ref":"P1","analysis":"<= 40 words of reasoning","decisiveParagraph":"D2.P1","action":"...",
 "reason":"one or two sentences explaining how each cited ref supports the action, naming each ref in [brackets]"}]}
+For raw-layout packages also add "evidenceRefs":["...","...","..."].
 If a package's extractedFacts is null, also add "vendorName", "invoiceNumber", "amountMinor" (integer minor units,
 e.g. INR 6542.76 -> 654276) and "currency" (ISO code) to its decision.
 Return one decision for every package ref."""
@@ -256,7 +262,7 @@ wrong. Re-read the body paragraphs (cover and decoy paragraphs are never decisiv
 evidence shows the invoice is reconciled, the same invoice was not already paid, no verification is pending, no
 material records conflict, and nothing places it outside autonomous authority for the current policy revision.
 Otherwise give the correct action (request_approval, hold_invoice, reject_duplicate or open_exception) and the id of
-the paragraph that decides it.
+the paragraph that decides it (for "layout":"raw" packages give "evidenceRefs" with the three decisive refs instead).
 Return JSON only:
 {"checks":[{"ref":"P1","confirm":true,"action":"settle_invoice","decisiveParagraph":"D2.P1","reason":"one or two
 sentences naming each cited ref in [brackets]"}]}"""
@@ -272,6 +278,36 @@ def strip_ids(pkg):
     return pkg
 
 
+def all_strings(o) -> list:
+    if isinstance(o, str):
+        return [o]
+    if isinstance(o, dict):
+        return [s for v in o.values() for s in all_strings(v)]
+    if isinstance(o, list):
+        return [s for v in o for s in all_strings(v)]
+    return []
+
+
+TOKEN_RE = re.compile(r"\b[A-Z]{1,4}_[A-Z0-9]{8,}\b")
+NON_DECISIVE_PREFIX = ("archive note", "training appendix", "training example", "cover sheet")
+
+
+def ref_inventory(pkg) -> tuple:
+    """Every evidence ref anywhere in the package, and the ones that belong to the cover sheet or decoys."""
+    found, excluded = [], set()
+    for s in all_strings(strip_ids(pkg)):
+        for m in BRACKET_RE.finditer(s):
+            r = m.group(1).strip()
+            if r and r not in found:
+                found.append(r)
+            if any(w in s[max(0, m.start() - 80):m.start()].lower() for w in NON_DECISIVE_PREFIX):
+                excluded.add(r)
+        for m in TOKEN_RE.finditer(s):
+            if m.group(0) not in found:
+                found.append(m.group(0))
+    return found, excluded
+
+
 def iter_texts(pkg) -> list:
     """(document name, text) pairs: the documents list first, then any other long text fields."""
     out = []
@@ -280,7 +316,9 @@ def iter_texts(pkg) -> list:
         for i, d in enumerate(docs, 1):
             if isinstance(d, dict):
                 t = d.get("text") or d.get("content") or d.get("body")
-                if isinstance(t, str):
+                if not isinstance(t, str):
+                    t = "\n\n".join(all_strings({k: v for k, v in d.items() if k not in ("name", "title", "id")}))
+                if t:
                     out.append((str(d.get("name") or d.get("title") or f"document-{i}"), t))
             elif isinstance(d, str):
                 out.append((f"document-{i}", d))
@@ -302,10 +340,10 @@ def iter_texts(pkg) -> list:
     return out
 
 
-def paragraphs(pkg) -> list:
+def paragraphs(pkg, split=r"\n\s*\n") -> list:
     paras = []
     for di, (name, text) in enumerate(iter_texts(pkg), 1):
-        for pi, chunk in enumerate(re.split(r"\n\s*\n", text), 1):
+        for pi, chunk in enumerate(re.split(split, text), 1):
             chunk = chunk.strip()
             if not chunk:
                 continue
@@ -341,12 +379,25 @@ def parse_facts(paras: list):
 
 
 def make_ctx(pkg: dict) -> dict:
-    paras = paragraphs(pkg)
-    return {"paras": paras, "byid": {p["id"]: p for p in paras}, "facts": parse_facts(paras),
-            "cands": [p for p in paras if p["kind"] == "body" and len(p["refs"]) == 3]}
+    def build(paras):
+        return {"paras": paras, "byid": {p["id"]: p for p in paras}, "facts": parse_facts(paras),
+                "cands": [p for p in paras if p["kind"] == "body" and len(p["refs"]) == 3]}
+
+    ctx = build(paragraphs(pkg))
+    if not ctx["cands"]:
+        alt = build(paragraphs(pkg, r"\n+"))
+        if alt["cands"]:
+            ctx = alt
+    found, excluded = ref_inventory(pkg)
+    ctx.update(pkg=pkg, allRefs=found, excludedRefs=excluded, raw=not ctx["cands"])
+    if ctx["raw"]:
+        log.info("unusual package layout %s, reading whole file: %s", package_id(pkg), canon(pkg)[:4000])
+    return ctx
 
 
 def llm_view(ctx: dict, label: str) -> dict:
+    if ctx["raw"]:
+        return {"ref": label, "extractedFacts": ctx["facts"], "layout": "raw", "rawPackage": strip_ids(ctx["pkg"])}
     return {"ref": label, "extractedFacts": ctx["facts"],
             "paragraphs": [{"id": p["id"], "doc": p["doc"], "kind": p["kind"], "refs": p["refs"], "text": p["text"]}
                            for p in ctx["paras"] if p["kind"] != "filler"]}
@@ -366,6 +417,9 @@ def to_minor(v):
 
 def llm_facts(raw: dict):
     amount = to_minor(raw.get("amountMinor"))
+    if amount is None and isinstance(raw.get("amountMinor"), str):
+        digits = re.sub(r"[,\s_]", "", raw["amountMinor"])
+        amount = int(digits) if digits.isdigit() else None
     vendor = str(raw.get("vendorName") or "").strip()
     inv = str(raw.get("invoiceNumber") or "").strip()
     cur = str(raw.get("currency") or "").strip().upper()
@@ -385,6 +439,20 @@ def validate_decision(raw, ctx: dict, prev_facts=None):
     action = str(raw.get("action", "")).strip()
     if action not in ACTIONS:
         return None
+    facts = ctx["facts"] or prev_facts or llm_facts(raw)
+    if not facts:
+        return None
+    if ctx["raw"]:
+        lower = {r.lower(): r for r in ctx["allRefs"]}
+        refs = []
+        for r in raw.get("evidenceRefs") or []:
+            r = lower.get(norm_ref(r).lower())
+            if r and r not in refs and r not in ctx["excludedRefs"]:
+                refs.append(r)
+        if len(refs) < 2:
+            return None
+        return dict(facts, action=action, evidenceRefs=refs[:3], paragraph="",
+                    reason=str(raw.get("reason") or "").strip())
     body = [p for p in ctx["paras"] if p["kind"] == "body" and len(p["refs"]) >= 2]
     p = ctx["byid"].get(str(raw.get("decisiveParagraph") or "").strip())
     if not (p and p["kind"] == "body" and len(p["refs"]) >= 2):
@@ -398,9 +466,6 @@ def validate_decision(raw, ctx: dict, prev_facts=None):
         p = ctx["cands"][0]
     if p is None:
         return None
-    facts = ctx["facts"] or prev_facts or llm_facts(raw)
-    if not facts:
-        return None
     return dict(facts, action=action, evidenceRefs=p["refs"][:3], paragraph=p["id"],
                 reason=str(raw.get("reason") or "").strip())
 
@@ -409,7 +474,7 @@ def fallback_decision(ctx: dict, reason: str) -> dict:
     if ctx["cands"]:
         refs, para = ctx["cands"][0]["refs"][:3], ctx["cands"][0]["id"]
     else:
-        refs = [r for p in ctx["paras"] if p["kind"] == "body" for r in p["refs"]][:3]
+        refs = [r for r in ctx.get("allRefs", []) if r not in ctx.get("excludedRefs", set())][:3]
         para = ""
     facts = ctx["facts"] or {"vendorName": "UNKNOWN VENDOR", "invoiceNumber": "UNKNOWN", "amountMinor": 0,
                              "currency": "INR"}
@@ -498,7 +563,7 @@ async def decide_chunk(policy: str, items: list) -> dict:
 
     for i, d in results.items():
         p = items[i][2]["byid"].get(d.get("paragraph"))
-        log.info("decision %s -> %s | %s", package_id(items[i][1]), d["action"], (p["text"][:160] if p else "-"))
+        log.info("decision %s -> %s %s | %s", package_id(items[i][1]), d["action"], d["evidenceRefs"], (p["text"][:160] if p else "whole-file mode"))
     return {items[i][0]: d for i, d in results.items()}
 
 
