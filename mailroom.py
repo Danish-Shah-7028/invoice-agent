@@ -26,7 +26,7 @@ PROFILE = "ga5-mailroom-action-gate/v2"
 MAILROOM_PATH = "/" + os.getenv("MAILROOM_PATH", "/v1/mailroom/actions").strip("/")
 MAX_BODY = 6 * 1024 * 1024
 MAX_RESPONSE = 512 * 1024
-PROMPT_VERSION = "mr-v2-rules"
+PROMPT_VERSION = "mr-v3-rules"
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
@@ -619,7 +619,7 @@ async def do_commit(req: dict, raw_hash: str) -> tuple:
         row = db.execute("SELECT input_digest, public_key, proposals, commit_hash, commit_response "
                          "FROM mr_evaluations WHERE evaluation_id=?", (ev_id,)).fetchone()
         if not row:
-            raise Reject(404, "UNKNOWN_EVALUATION", "No proposal exists for this evaluation.")
+            raise Reject(409, "UNKNOWN_EVALUATION", "No proposal exists for this evaluation.")
         input_digest, pub, stored_json, commit_hash, commit_resp = row
         if commit_hash:
             if commit_hash == raw_hash:
@@ -735,7 +735,7 @@ def record(raw: bytes, status: int, text: str) -> None:
         db.execute("INSERT INTO mr_debug(ts, op, evaluation_id, status, request, response) VALUES(?,?,?,?,?,?)",
                    (datetime.now(timezone.utc).isoformat(), op, ev, status, raw.decode("utf-8", "replace")[:800000],
                     text[:600000]))
-        db.execute("DELETE FROM mr_debug WHERE id NOT IN (SELECT id FROM mr_debug ORDER BY id DESC LIMIT 14)")
+        db.execute("DELETE FROM mr_debug WHERE id NOT IN (SELECT id FROM mr_debug ORDER BY id DESC LIMIT 40)")
     except Exception:
         log.exception("flight recorder failed")
 
