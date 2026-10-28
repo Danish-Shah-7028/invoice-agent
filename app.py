@@ -32,6 +32,8 @@ from starlette.routing import Route
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("a2a")
 
+import mailroom  # noqa: E402  (Question 3: POST /v1/mailroom/actions)
+
 # ----------------------------------------------------------------------------- config
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # e.g. https://you-invoice.hf.space/a2a/
 BASE_PATH = (urlparse(PUBLIC_BASE_URL).path if PUBLIC_BASE_URL else os.getenv("BASE_PATH", "/a2a/")) or "/"
@@ -817,6 +819,9 @@ def handle_list(principal: str, q) -> Response:
 # ----------------------------------------------------------------------------- router
 async def router(request: Request):
     path = request.scope.get("path") or "/"  # already percent-decoded (":" may arrive as %3A)
+    if path.rstrip("/") == mailroom.MAILROOM_PATH:
+        status, text = await mailroom.handle(request.method, await request.body())
+        return Response(content=text.encode("utf-8"), status_code=status, media_type="application/json")
     try:
         if path == "/.well-known/agent-card.json":
             if request.method != "GET":
