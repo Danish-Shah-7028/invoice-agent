@@ -26,7 +26,7 @@ PROFILE = "ga5-mailroom-action-gate/v2"
 MAILROOM_PATH = "/" + os.getenv("MAILROOM_PATH", "/v1/mailroom/actions").strip("/")
 MAX_BODY = 6 * 1024 * 1024
 MAX_RESPONSE = 512 * 1024
-PROMPT_VERSION = "mr-v3-rules"
+PROMPT_VERSION = "mr-v4-rules"
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
