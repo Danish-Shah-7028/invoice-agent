@@ -63,6 +63,9 @@ class View:
         return [(s, lid, t) for s, lid, t in self.lines if pred(s, t)]
 
     def rule(self, pattern):
+        """The signed rule line that governs the action. Paraphrases vary between cases, so match broad keywords
+        first; if none match and the dossier holds exactly one case-specific signed rule, that rule governs."""
+        specific = []
         for s in self.d.get("sources", []):
             if kind(s) != "policy" or not trusted(s):
                 continue
@@ -70,14 +73,29 @@ class View:
                 t = ln.get("text") or ""
                 if GENERIC_RULE.search(t) or NON_SPECIFIC_RULE.search(t):
                     continue
-                if re.search(pattern, t, re.I):
-                    return (s, ln["lineId"], t)
-        return None
+                specific.append((s, ln["lineId"], t))
+        for hit in specific:
+            if re.search(pattern, hit[2], re.I):
+                return hit
+        return specific[0] if len(specific) == 1 else None
 
 
 def first(pattern, text, group=0):
     m = re.search(pattern, text)
     return (m.group(group) if group else m.group(0)) if m else None
+
+
+TEAM_PATTERNS = [r"requires ([a-z0-9][a-z0-9\-]+) confirmation", r"confirmation (?:by|from) (?:the )?([a-z0-9][a-z0-9\-]+)",
+                 r"([a-z0-9]+-[a-z0-9\-]+) (?:must|should|needs to) (?:confirm|verify)",
+                 r"(?:route|refer|escalate)\w* (?:it |this |the case )?to (?:the )?([a-z0-9]+-[a-z0-9\-]+)"]
+
+
+def team_of(text):
+    for p in TEAM_PATTERNS:
+        m = re.search(p, text, re.I)
+        if m and "@" not in m.group(1):
+            return m.group(1)
+    return None
 
 
 def decision(action, target, payload, evidence):
@@ -101,21 +119,22 @@ def decide(d):
         artifact = first(ATT, att_line[1]) if att_line else None
         if not artifact:
             return None
-        rule = v.rule(r"quarantine|security holding|exfiltrat|direct tool use|untrusted")
+        rule = v.rule(r"quarantin|isolat|security (holding|queue|area)|exfiltrat|tool use|control tools|untrusted|hostile|"
+                      r"embedded (destination|address)")
         ev = [lid for s, lid, t in inj if s is src] + [att_line[0]] + ([rule[1]] if rule else [])
         return decision("quarantine_item", {"kind": "security_queue", "id": "mailroom"},
                         {"artifactId": artifact, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, ev)
 
     # 2. Sender identity conflicts with the authenticated record -> owning approval queue confirms.
     ident = v.find(lambda s, t: trusted(s) and re.search(MISMATCH, t, re.I) and re.search(EMAIL, t)
-                   and re.search(r"requires ([a-z0-9][a-z0-9\-]+) confirmation", t, re.I))
+                   and team_of(t))
     if ident:
         s0, lid0, t0 = ident[0]
-        team = first(r"requires ([a-z0-9][a-z0-9\-]+) confirmation", t0, 1)
+        team = team_of(t0)
         sender = first(EMAIL, t0)
         claim = v.find(lambda s, t: external(s) and sender in t)
         ref = first(CASE, t0) or (first(ORD, claim[0][2]) if claim else None)
-        rule = v.rule(r"identity|verify the request|confirm")
+        rule = v.rule(r"identity|verif|confirm|mismatch|challenge|differ|claimed correspondent|contact")
         ev = [lid0] + [lid for _, lid, _ in claim[:1]] + ([rule[1]] if rule else [])
         return decision("request_confirmation", {"kind": "approval_queue", "id": team},
                         {"claimedSender": sender, "questionCode": "VERIFY_REQUEST", "referenceId": ref}, ev)
@@ -126,7 +145,7 @@ def decide(d):
     if evt:
         s0, lid0, t0 = evt[0]
         sig = [lid for s, lid, t in v.lines if s is s0 and lid != lid0 and re.search(r"verified|signature", t, re.I)]
-        rule = v.rule(r"carrier|case[- ]field|record field|field mutation|mutation")
+        rule = v.rule(r"carrier|case[- ]field|record field|mutation|named field|single field|field change")
         ev = [lid0] + sig + ([rule[1]] if rule else [])
         return decision("update_internal_record", {"kind": "case_record", "id": first(CASE, t0)},
                         {"field": "delivery_window", "sourceEventId": first(EVT, t0), "value": first(QUOTED, t0, 1)},
@@ -141,7 +160,7 @@ def decide(d):
         code = {"informational": "INFORMATIONAL", "duplicate": "DUPLICATE"}.get(word, "ALREADY_COMPLETED")
         msg = v.find(lambda s, t: external(s) and re.search(ORD, t))
         ref = first(CASE, t0) or (first(ORD, msg[0][2]) if msg else None)
-        rule = v.rule(r"side effect|suppress|repeat|duplicate")
+        rule = v.rule(r"side effect|suppress|repeat|duplicate|already (complete|handled)|informational|no new")
         ev = [lid0] + ([msg[0][1]] if msg else []) + ([rule[1]] if rule else [])
         return decision("no_action", None, {"reasonCode": code, "referenceId": ref}, ev)
 
