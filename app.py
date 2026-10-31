@@ -538,9 +538,13 @@ async def call_chat(system: str, user: dict, timeout: float) -> dict:
     payload = {"model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]}
+    if "generativelanguage" in LLM_BASE_URL:            # Gemini: keep "thinking" short so calls finish in time
+        payload["reasoning_effort"] = "none" if "2.5-flash" in LLM_MODEL else "low"
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
                               headers={"Authorization": f"Bearer {LLM_API_KEY}"})
+        if r.status_code >= 400:
+            log.warning("LLM HTTP %s: %s", r.status_code, r.text[:300])
         r.raise_for_status()
         return parse_json(r.json()["choices"][0]["message"]["content"])
 
@@ -559,7 +563,7 @@ async def decide_chunk(policy: str, items: list) -> dict:
     if MOCK_LLM:
         return {k: fallback_decision(c, "Mock mode: no model call was made.") for k, _, c in items}
     results, pending = {}, list(range(len(items)))
-    for timeout in (25.0, 10.0):
+    for timeout in (32.0, 9.0):
         if not pending:
             break
         sub = [items[i] for i in pending]
