@@ -204,7 +204,7 @@ def agent_card(request: Request) -> dict:
 # decoys are labelled, and the model picks the action plus the ONE paragraph that decides it. Evidence refs
 # are then copied from that paragraph (so they are always the exact three refs from the decisive paragraph),
 # and the invoice facts are parsed from the cover sheet with a regex instead of being guessed.
-PROMPT_VERSION = "v3-paragraphs-raw"
+PROMPT_VERSION = "v4-paragraphs-kw"
 VERIFY_SETTLE = os.getenv("VERIFY_SETTLE", "1") == "1"
 
 BRACKET_RE = re.compile(r"\[([^\[\]\n]{1,120})\]")
@@ -472,6 +472,38 @@ def validate_decision(raw, ctx: dict, prev_facts=None):
                 reason=str(raw.get("reason") or "").strip())
 
 
+# Keyword reader for the decisive paragraph. Used when the model is unavailable or unusable, and as a safety
+# cross-check on model "settle" decisions. Order matters: blockers first, settlement last.
+CLASS_RULES = [
+    ("hold_invoice", re.compile(r"beneficiary|bank account|destination[- ]account|remittance|payee detail|"
+                                r"callback|call-back|out-of-band|pre-existing contact|known-number|"
+                                r"verification .{0,40}(not completed|pending|outstanding)|pauses release|"
+                                r"until .{0,40}(verif|inspect|confirm)", re.I)),
+    ("reject_duplicate", re.compile(r"earlier settled|already (been )?paid|already settled|completed payment|"
+                                    r"earlier posting|paid-items ledger contains|same commercial key|"
+                                    r"duplicate-control|duplicate control policy", re.I)),
+    ("request_approval", re.compile(r"outside the [\w'.,\- ]{0,50}authority|exceeds [\w'.,\- ]{0,50}(delegat|authority|limit)|"
+                                    r"above [\w'.,\- ]{0,40}(limit|authority)|beyond [\w'.,\- ]{0,40}(authority|delegat)|"
+                                    r"outside the (operator|queue|agent)|outside (its|delegated|autonomous)|"
+                                    r"only up to|without escalation only|approval workflow|financial-approval|"
+                                    r"requires? (a )?(human|manual|financial) approv", re.I)),
+    ("open_exception", re.compile(r"does not reconcile|not reconcile|outside the permitted reconciliation|"
+                                  r"beyond (the )?tolerance|conflicts? with the|contradictory|mutually in|"
+                                  r"mismatch|disagree|discrepanc(y|ies) (remains?|persists?)", re.I)),
+    ("settle_invoice", re.compile(r"same payable total|reconciled|reconcile without|three-way match|"
+                                  r"agree within|covers every billed|full quantity|no exception", re.I)),
+]
+
+
+def classify_paragraph(text: str):
+    t = re.sub(r"no paid item|found no paid|no (prior|earlier) payment|not (a )?duplicate|"
+               r"\bno [^.]{0,80}discrepanc(y|ies) remains?", " ", text, flags=re.I)
+    for action, rx in CLASS_RULES:
+        if rx.search(t):
+            return action
+    return None
+
+
 def fallback_decision(ctx: dict, reason: str) -> dict:
     if ctx["cands"]:
         refs, para = ctx["cands"][0]["refs"][:3], ctx["cands"][0]["id"]
@@ -480,6 +512,12 @@ def fallback_decision(ctx: dict, reason: str) -> dict:
         para = ""
     facts = ctx["facts"] or {"vendorName": "UNKNOWN VENDOR", "invoiceNumber": "UNKNOWN", "amountMinor": 0,
                              "currency": "INR"}
+    if len(ctx["cands"]) == 1:
+        action = classify_paragraph(ctx["cands"][0]["text"])
+        if action:
+            return dict(facts, action=action, evidenceRefs=refs, paragraph=para, _fallback=True,
+                        reason=f"The decisive paragraph states the controlling facts for {action}: "
+                               + " ".join(f"[{r}]" for r in refs) + ".")
     return dict(facts, action="open_exception", evidenceRefs=refs, paragraph=para, reason=reason, _fallback=True)
 
 
@@ -563,6 +601,13 @@ async def decide_chunk(policy: str, items: list) -> dict:
         except Exception as e:
             log.warning("settlement verification failed (%s): %s", type(e).__name__, str(e)[:200])
 
+    for i, d in list(results.items()):
+        p = items[i][2]["byid"].get(d.get("paragraph"))
+        if p and d["action"] == "settle_invoice":
+            kw = classify_paragraph(p["text"])
+            if kw and kw != "settle_invoice":
+                log.info("keyword check overruled settle -> %s for %s", kw, package_id(items[i][1]))
+                results[i] = dict(d, action=kw)
     for i, d in results.items():
         p = items[i][2]["byid"].get(d.get("paragraph"))
         log.info("decision %s -> %s %s | %s", package_id(items[i][1]), d["action"], d["evidenceRefs"], (p["text"][:160] if p else "whole-file mode"))
@@ -590,7 +635,7 @@ async def decide_packages(policy: str, packages: list) -> list:
             for part in await asyncio.gather(*(decide_chunk(policy, c) for c in chunks)):
                 for k, d in part.items():
                     decided[k] = d
-                    if not d.get("_fallback"):
+                    if not d.get("_fallback") or d["action"] != "open_exception" or not d.get("paragraph"):
                         put_decision(k, d)
         return [decided[k] for k in keys]
     finally:
